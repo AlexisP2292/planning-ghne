@@ -401,96 +401,89 @@ def parse_mois_travailles(file_obj, doc_constraints):
 
 def parse_prev_weekend(file_obj, doc_constraints):
     """
-    Lit le planning du dernier week-end précédent (format NOM + Initiale du prénom,
-    y compris multi-noms dans une même cellule) et déduit les repos de sécurité
-    en tout début de période (Lundi D0 / Mardi D1).
+    Lit le planning du dernier week-end précédent en ciblant la ligne 7 (index 6)
+    aux colonnes B7 (index 1) et G7 à K7 (indices 6 à 10), où chaque médecin est
+    renseigné au format 'Nom + (Première lettre du prénom).', afin de bloquer
+    les temps de repos sur le début du nouveau planning.
     """
     if file_obj is None:
         return {}
     try:
-        df_pw = pd.read_excel(file_obj, header=None)
+        sheets_dict = pd.read_excel(file_obj, sheet_name=None, header=None)
     except Exception:
         return {}
 
-    # Construire les signatures "NOM + Initiale" pour chaque médecin
+    if not sheets_dict:
+        return {}
+
+    # Construire les signatures "Nom + Initiale du prénom" pour chaque médecin
     doc_signatures = {}
     for c_doc, info in doc_constraints.items():
         sigs = set()
         full_name = info.get("desid_matched_name") or c_doc
         toks = tokenize_name(full_name)
         if len(toks) >= 2:
-            # Format standard "NOM Prénom" -> "nomp" et "nom p"
-            nom_part = "".join(toks[:-1])
-            prenom_init = toks[-1][0]
-            sigs.add(f"{nom_part}{prenom_init}")
-            # Cas inverse "Prénom NOM"
-            sigs.add(f"{''.join(toks[1:])}{toks[0][0]}")
+            # Format standard "NOM Prénom" (y compris noms ou prénoms composés)
+            for split_idx in range(1, len(toks)):
+                nom_part = "".join(toks[:split_idx])
+                prenom_init = toks[split_idx][0]
+                sigs.add(f"{nom_part}{prenom_init}")
+                initials_all = "".join(t[0] for t in toks[split_idx:])
+                sigs.add(f"{nom_part}{initials_all}")
+            # Cas inverse éventuel "Prénom NOM"
+            for split_idx in range(1, len(toks)):
+                nom_part = "".join(toks[split_idx:])
+                prenom_init = toks[0][0]
+                sigs.add(f"{nom_part}{prenom_init}")
         elif len(toks) == 1:
             sigs.add(toks[0])
+
         c_toks = tokenize_name(c_doc)
         if c_toks:
             sigs.add("".join(c_toks))
         doc_signatures[c_doc] = {s for s in sigs if len(s) >= 3}
-
-    # Repérer les colonnes Samedi / Dimanche et les lignes Jour / Nuit
-    sat_cols, sun_cols = set(), set()
-    for r in range(min(15, df_pw.shape[0])):
-        for c in range(df_pw.shape[1]):
-            val = df_pw.iloc[r, c]
-            if pd.isna(val):
-                continue
-            s_norm = strip_accents(str(val)).lower()
-            if "samedi" in s_norm or re.search(r"\bsam\b", s_norm):
-                sat_cols.add(c)
-            elif "dimanche" in s_norm or re.search(r"\bdim\b", s_norm):
-                sun_cols.add(c)
-
-    # Si les colonnes Samedi/Dimanche ne sont pas explicites, prendre la dernière colonne comme Dimanche
-    if not sun_cols and df_pw.shape[1] >= 2:
-        sun_cols.add(df_pw.shape[1] - 1)
-        if df_pw.shape[1] >= 3:
-            sat_cols.add(df_pw.shape[1] - 2)
 
     prev_we_rest = {
         c_doc: {"sat_24h": False, "sun_any": False, "sun_night": False}
         for c_doc in doc_constraints.keys()
     }
 
-    for r in range(df_pw.shape[0]):
-        row_label = " ".join(
-            strip_accents(str(df_pw.iloc[r, c_lbl])).lower()
-            for c_lbl in range(min(3, df_pw.shape[1]))
-            if pd.notnull(df_pw.iloc[r, c_lbl])
-        )
-        is_night_row = any(k in row_label for k in ["nuit", "garde", "18h", "18:00", "demi"])
-        is_day_row = any(k in row_label for k in ["jour", "08h", "08:00", "08:30", "matin"])
+    # On cible la dernière feuille du classeur (correspondant à la fin de période précédente)
+    sheets_list = list(sheets_dict.values())
+    target_sheets = [sheets_list[-1]]
 
-        for c in range(df_pw.shape[1]):
-            cell = df_pw.iloc[r, c]
+    # Ligne 7 en Excel = index 6 ; Colonnes B7 (1) et G7 à K7 (6, 7, 8, 9, 10)
+    sunday_row_idx = 6
+    night_col_indices = [1, 6, 7, 8, 9, 10]
+
+    for df_pw in target_sheets:
+        if df_pw is None or df_pw.shape[0] <= sunday_row_idx:
+            continue
+        for c in night_col_indices:
+            if c >= df_pw.shape[1]:
+                continue
+            cell = df_pw.iloc[sunday_row_idx, c]
             if pd.isna(cell):
                 continue
             raw_cell = str(cell).strip()
             if not raw_cell or raw_cell.lower() in {"nan", "none", "nat"}:
                 continue
 
-            # Découper les cellules contenant plusieurs médecins (retours ligne, virgules, slashs)
-            entries = [e.strip() for e in re.split(r"[\n\r,;/]+", raw_cell) if e.strip()]
+            # Découper d'éventuelles cellules multi-noms (retours ligne, virgules, slashs)
+            entries = [e.strip() for e in re.split(r"[\n\r,;/&]+", raw_cell) if e.strip()]
             for entry in entries:
-                entry_clean = clean_str(entry)
+                entry_no_paren = re.sub(r"\(.*?\)", "", entry).strip()
+                entry_clean = clean_str(entry_no_paren)
                 if len(entry_clean) < 3:
                     continue
                 for c_doc, sigs in doc_signatures.items():
                     matched_sig = any(
-                        entry_clean == sig or entry_clean.startswith(sig)
+                        entry_clean == sig or (len(sig) >= 5 and entry_clean.startswith(sig))
                         for sig in sigs
                     )
                     if matched_sig:
-                        if c in sun_cols:
-                            prev_we_rest[c_doc]["sun_any"] = True
-                            if is_night_row or not is_day_row:
-                                prev_we_rest[c_doc]["sun_night"] = True
-                        elif c in sat_cols and is_night_row:
-                            prev_we_rest[c_doc]["sat_24h"] = True
+                        prev_we_rest[c_doc]["sun_any"] = True
+                        prev_we_rest[c_doc]["sun_night"] = True
 
     return prev_we_rest
 
